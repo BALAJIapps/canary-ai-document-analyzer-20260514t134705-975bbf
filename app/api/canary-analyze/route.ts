@@ -63,6 +63,8 @@ export async function POST(req: NextRequest) {
     }
 
     // Call AI for structured analysis
+    // Note: response_format: json_object is NOT used — incompatible with Gemini gateway
+    // JSON output is enforced via system prompt instruction only
     let analysisResult: {
       summary: string;
       key_points: string[];
@@ -73,11 +75,16 @@ export async function POST(req: NextRequest) {
     try {
       const completion = await openai.chat.completions.create({
         model: AI_TEXT_MODEL,
-        response_format: { type: "json_object" },
         messages: [
           {
             role: "system",
-            content: `You are a document analysis assistant. Analyze the provided document and return a JSON object with these fields:\n- summary: A concise 2-3 sentence summary of the document\n- key_points: An array of 3-5 key points from the document\n- topics: An array of 2-4 main topics covered\n- sentiment: One of "positive", "negative", "neutral", or "mixed"\n\nReturn ONLY valid JSON, no markdown.`,
+            content: `You are a document analysis assistant. Analyze the provided document and return ONLY a valid JSON object with no markdown, no code fences, no extra text — just raw JSON with these exact fields:
+{
+  "summary": "A concise 2-3 sentence summary",
+  "key_points": ["point 1", "point 2", "point 3"],
+  "topics": ["topic 1", "topic 2"],
+  "sentiment": "positive|negative|neutral|mixed"
+}`,
           },
           {
             role: "user",
@@ -87,12 +94,15 @@ export async function POST(req: NextRequest) {
         max_tokens: 1024,
       });
 
-      const raw = completion.choices[0]?.message?.content ?? "{}";
+      const raw = (completion.choices[0]?.message?.content ?? "{}").trim();
+      // Strip markdown code fences if model wraps in them anyway
+      const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
       let parsed: Record<string, unknown> = {};
       try {
-        parsed = JSON.parse(raw) as Record<string, unknown>;
+        parsed = JSON.parse(cleaned) as Record<string, unknown>;
       } catch {
-        parsed = {};
+        // If JSON parse fails, attempt to extract a summary from raw text
+        parsed = { summary: cleaned.slice(0, 300) };
       }
       analysisResult = {
         summary: typeof parsed.summary === "string" ? parsed.summary : "Document analyzed.",
@@ -133,11 +143,9 @@ export async function POST(req: NextRequest) {
       })
       .returning();
 
-    // Store embedding using parameterized Drizzle execute (avoids injection)
+    // Store embedding using parameterized sql tag (safe — drizzle sql`` uses bindings)
     if (embeddingVector && embeddingVector.length > 0) {
       try {
-        // Use sql template tag with proper casting — JSON.stringify inside sql`` is safe
-        // because drizzle-orm sql`` uses parameterized bindings under the hood
         await db.execute(
           sql`UPDATE canary_documents SET embedding = ${JSON.stringify(embeddingVector)}::vector WHERE id = ${document_id}::uuid`
         );
