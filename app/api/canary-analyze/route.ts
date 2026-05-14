@@ -1,14 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { canaryDocuments, canaryDocumentAnalyses } from "@/db/schema";
-import { eq } from "drizzle-orm";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { openai } from "@/lib/ai";
 
 export const runtime = "nodejs";
 
 const AI_TEXT_MODEL = process.env.AI_TEXT_MODEL ?? "gemini-2.0-flash";
 const AI_EMBEDDING_MODEL = process.env.AI_EMBEDDING_MODEL ?? "gemini-embedding-001";
+
+const MAX_TEXT_LENGTH = 50000;
 
 export async function POST(req: NextRequest) {
   try {
@@ -25,6 +26,12 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         { ok: false, error: { code: "MISSING_TEXT", message: "document_text is required" } },
         { status: 400 }
+      );
+    }
+    if (document_text.length > MAX_TEXT_LENGTH) {
+      return NextResponse.json(
+        { ok: false, error: { code: "TEXT_TOO_LARGE", message: `document_text must be under ${MAX_TEXT_LENGTH} characters` } },
+        { status: 413 }
       );
     }
 
@@ -70,13 +77,7 @@ export async function POST(req: NextRequest) {
         messages: [
           {
             role: "system",
-            content: `You are a document analysis assistant. Analyze the provided document and return a JSON object with these fields:
-- summary: A concise 2-3 sentence summary of the document
-- key_points: An array of 3-5 key points from the document
-- topics: An array of 2-4 main topics covered
-- sentiment: One of "positive", "negative", "neutral", or "mixed"
-
-Return ONLY valid JSON, no markdown.`,
+            content: `You are a document analysis assistant. Analyze the provided document and return a JSON object with these fields:\n- summary: A concise 2-3 sentence summary of the document\n- key_points: An array of 3-5 key points from the document\n- topics: An array of 2-4 main topics covered\n- sentiment: One of "positive", "negative", "neutral", or "mixed"\n\nReturn ONLY valid JSON, no markdown.`,
           },
           {
             role: "user",
@@ -87,15 +88,20 @@ Return ONLY valid JSON, no markdown.`,
       });
 
       const raw = completion.choices[0]?.message?.content ?? "{}";
-      const parsed = JSON.parse(raw);
+      let parsed: Record<string, unknown> = {};
+      try {
+        parsed = JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        parsed = {};
+      }
       analysisResult = {
         summary: typeof parsed.summary === "string" ? parsed.summary : "Document analyzed.",
-        key_points: Array.isArray(parsed.key_points) ? parsed.key_points : [],
-        topics: Array.isArray(parsed.topics) ? parsed.topics : [],
+        key_points: Array.isArray(parsed.key_points) ? (parsed.key_points as string[]) : [],
+        topics: Array.isArray(parsed.topics) ? (parsed.topics as string[]) : [],
         sentiment: typeof parsed.sentiment === "string" ? parsed.sentiment : "neutral",
       };
     } catch (aiErr) {
-      console.error("[canary-analyze] AI call failed", aiErr);
+      console.error("[canary-analyze] AI call failed", aiErr instanceof Error ? aiErr.message : aiErr);
       return NextResponse.json(
         { ok: false, error: { code: "AI_ERROR", message: "AI analysis failed" } },
         { status: 502 }
@@ -111,7 +117,7 @@ Return ONLY valid JSON, no markdown.`,
       });
       embeddingVector = embeddingResponse.data[0]?.embedding ?? null;
     } catch (embErr) {
-      console.error("[canary-analyze] Embedding failed (non-fatal)", embErr);
+      console.error("[canary-analyze] Embedding failed (non-fatal)", embErr instanceof Error ? embErr.message : embErr);
     }
 
     // Store the analysis
@@ -127,14 +133,16 @@ Return ONLY valid JSON, no markdown.`,
       })
       .returning();
 
-    // Store embedding in canary_documents if we got one
+    // Store embedding using parameterized Drizzle execute (avoids injection)
     if (embeddingVector && embeddingVector.length > 0) {
       try {
+        // Use sql template tag with proper casting — JSON.stringify inside sql`` is safe
+        // because drizzle-orm sql`` uses parameterized bindings under the hood
         await db.execute(
-          sql`UPDATE canary_documents SET embedding = ${JSON.stringify(embeddingVector)}::vector WHERE id = ${document_id}`
+          sql`UPDATE canary_documents SET embedding = ${JSON.stringify(embeddingVector)}::vector WHERE id = ${document_id}::uuid`
         );
       } catch (vecErr) {
-        console.error("[canary-analyze] Vector update failed (non-fatal)", vecErr);
+        console.error("[canary-analyze] Vector update failed (non-fatal)", vecErr instanceof Error ? vecErr.message : vecErr);
       }
     }
 
@@ -152,7 +160,7 @@ Return ONLY valid JSON, no markdown.`,
       },
     });
   } catch (err) {
-    console.error("[canary-analyze POST]", err);
+    console.error("[canary-analyze POST] Unhandled error", err instanceof Error ? err.message : err);
     return NextResponse.json(
       { ok: false, error: { code: "INTERNAL", message: "Internal server error" } },
       { status: 500 }

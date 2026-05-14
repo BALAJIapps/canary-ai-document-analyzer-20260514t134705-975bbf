@@ -7,6 +7,7 @@ import { openai } from "@/lib/ai";
 export const runtime = "nodejs";
 
 const AI_EMBEDDING_MODEL = process.env.AI_EMBEDDING_MODEL ?? "gemini-embedding-001";
+const MAX_QUERY_LENGTH = 2000;
 
 export async function POST(req: NextRequest) {
   try {
@@ -17,6 +18,12 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         { ok: false, error: { code: "MISSING_QUERY", message: "query is required" } },
         { status: 400 }
+      );
+    }
+    if (query.length > MAX_QUERY_LENGTH) {
+      return NextResponse.json(
+        { ok: false, error: { code: "QUERY_TOO_LONG", message: `query must be under ${MAX_QUERY_LENGTH} characters` } },
+        { status: 413 }
       );
     }
 
@@ -44,7 +51,7 @@ export async function POST(req: NextRequest) {
         const queryEmbedding = embeddingResponse.data[0]?.embedding;
 
         if (queryEmbedding && queryEmbedding.length > 0) {
-          // Exact cosine similarity scan (no ANN index on vector(3072))
+          // Use drizzle sql`` template — values are parameterized bindings
           const vectorResults = await db.execute(
             sql`
               SELECT
@@ -78,7 +85,7 @@ export async function POST(req: NextRequest) {
           }));
         }
       } catch (embErr) {
-        console.error("[canary-document-search] Vector search failed, falling back", embErr);
+        console.error("[canary-document-search] Vector search failed, falling back", embErr instanceof Error ? embErr.message : embErr);
       }
     }
 
@@ -90,30 +97,19 @@ export async function POST(req: NextRequest) {
         .orderBy(desc(canaryDocuments.createdAt))
         .limit(10);
 
-      results = kwResults
-        .filter(
-          (d) =>
-            d.title.toLowerCase().includes(queryText.toLowerCase()) ||
-            d.documentText.toLowerCase().includes(queryText.toLowerCase())
-        )
-        .map((d) => ({
-          id: d.id,
-          title: d.title,
-          source_name: d.sourceName,
-          document_text: d.documentText,
-          created_at: d.createdAt,
-        }));
+      const filtered = kwResults.filter(
+        (d) =>
+          d.title.toLowerCase().includes(queryText.toLowerCase()) ||
+          d.documentText.toLowerCase().includes(queryText.toLowerCase())
+      );
 
-      // If still no results from keyword, return recent docs
-      if (results.length === 0) {
-        results = kwResults.map((d) => ({
-          id: d.id,
-          title: d.title,
-          source_name: d.sourceName,
-          document_text: d.documentText,
-          created_at: d.createdAt,
-        }));
-      }
+      results = (filtered.length > 0 ? filtered : kwResults).map((d) => ({
+        id: d.id,
+        title: d.title,
+        source_name: d.sourceName,
+        document_text: d.documentText,
+        created_at: d.createdAt,
+      }));
     }
 
     // Enrich results with analysis data
@@ -137,7 +133,8 @@ export async function POST(req: NextRequest) {
                 }
               : null,
           };
-        } catch {
+        } catch (enrichErr) {
+          console.error("[canary-document-search] Enrichment failed for doc", r.id, enrichErr instanceof Error ? enrichErr.message : enrichErr);
           return { ...r, analysis: null };
         }
       })
@@ -150,7 +147,7 @@ export async function POST(req: NextRequest) {
       total: enriched.length,
     });
   } catch (err) {
-    console.error("[canary-document-search POST]", err);
+    console.error("[canary-document-search POST] Unhandled error", err instanceof Error ? err.message : err);
     return NextResponse.json(
       { ok: false, error: { code: "INTERNAL", message: "Internal server error" } },
       { status: 500 }
