@@ -62,9 +62,9 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    console.log(`[canary-analyze] Using model=${AI_TEXT_MODEL} gateway=${gatewayUrl}`);
+
     // Call AI for structured analysis
-    // Note: response_format: json_object is NOT used — incompatible with Gemini gateway
-    // JSON output is enforced via system prompt instruction only
     let analysisResult: {
       summary: string;
       key_points: string[];
@@ -101,7 +101,6 @@ export async function POST(req: NextRequest) {
       try {
         parsed = JSON.parse(cleaned) as Record<string, unknown>;
       } catch {
-        // If JSON parse fails, attempt to extract a summary from raw text
         parsed = { summary: cleaned.slice(0, 300) };
       }
       analysisResult = {
@@ -111,9 +110,12 @@ export async function POST(req: NextRequest) {
         sentiment: typeof parsed.sentiment === "string" ? parsed.sentiment : "neutral",
       };
     } catch (aiErr) {
-      console.error("[canary-analyze] AI call failed", aiErr instanceof Error ? aiErr.message : aiErr);
+      const errMsg = aiErr instanceof Error ? aiErr.message : String(aiErr);
+      const errStatus = (aiErr as { status?: number }).status;
+      const errBody = (aiErr as { error?: unknown }).error;
+      console.error(`[canary-analyze] AI call failed status=${errStatus} message=${errMsg} body=${JSON.stringify(errBody)}`);
       return NextResponse.json(
-        { ok: false, error: { code: "AI_ERROR", message: "AI analysis failed" } },
+        { ok: false, error: { code: "AI_ERROR", message: `AI analysis failed: ${errMsg}` } },
         { status: 502 }
       );
     }
@@ -143,7 +145,7 @@ export async function POST(req: NextRequest) {
       })
       .returning();
 
-    // Store embedding using parameterized sql tag (safe — drizzle sql`` uses bindings)
+    // Store embedding using parameterized sql tag
     if (embeddingVector && embeddingVector.length > 0) {
       try {
         await db.execute(
